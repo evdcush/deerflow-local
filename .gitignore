@@ -1,0 +1,6 @@
+/data/
+/skills/custom/
+/workspace/
+/reference/
+.env
+__pycache__/

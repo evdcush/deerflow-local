@@ -1,0 +1,138 @@
+# DeerFlow v2.2.0 config for the self-hosted stack (mounted read-only at
+# /app/backend/config.yaml). Everything not set here uses DeerFlow's
+# defaults; the full annotated schema is upstream's config.example.yaml:
+# https://github.com/bytedance/deer-flow/blob/v2.2.0/config.example.yaml
+# `$NAME` values are read from the gateway container's environment.
+config_version: 63
+log_level: info
+
+token_usage:
+  enabled: true
+
+models:
+  # swol-doge through LiteLLM (llama.cpp, Qwen-style chat template), via
+  # nginx: the gateway has no direct network route out.
+  # DeerFlow's flash mode turns reasoning off, thinking modes turn it on.
+  - name: swol-doge
+    display_name: Local swol-doge
+    use: langchain_openai:ChatOpenAI
+    model: swol-doge
+    api_key: $LITELLM_API_KEY
+    base_url: http://deer-flow-nginx:4000/v1
+    request_timeout: 600.0
+    max_retries: 2
+    max_tokens: 32768
+    context_window: 262144
+    supports_vision: true
+    supports_thinking: true
+    when_thinking_enabled:
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+    when_thinking_disabled:
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+
+tool_groups:
+  - name: web
+  - name: file:read
+  - name: file:write
+  - name: bash
+
+tools:
+  # The search gateway (search-gateway:8080 on ai-backend), reached
+  # through nginx's egress forwarder like LiteLLM above.
+  - name: web_search
+    group: web
+    use: custom_tools.search_gateway:web_search_tool
+    base_url: http://deer-flow-nginx:8080
+    api_key: $SEARCH_GATEWAY_API_KEY
+    max_results: 8
+  - name: web_fetch
+    group: web
+    use: custom_tools.search_gateway:web_fetch_tool
+    base_url: http://deer-flow-nginx:8080
+    api_key: $SEARCH_GATEWAY_API_KEY
+    max_chars: 12000
+
+  - name: ls
+    group: file:read
+    use: deerflow.sandbox.tools:ls_tool
+  - name: read_file
+    group: file:read
+    use: deerflow.sandbox.tools:read_file_tool
+  - name: glob
+    group: file:read
+    use: deerflow.sandbox.tools:glob_tool
+    max_results: 800
+  - name: grep
+    group: file:read
+    use: deerflow.sandbox.tools:grep_tool
+    max_results: 500
+  - name: write_file
+    group: file:write
+    use: deerflow.sandbox.tools:write_file_tool
+  - name: str_replace
+    group: file:write
+    use: deerflow.sandbox.tools:str_replace_tool
+  - name: bash
+    group: bash
+    use: deerflow.sandbox.tools:bash_tool
+
+sandbox:
+  use: deerflow.sandbox.local:LocalSandboxProvider
+  # "Host" bash = inside the gateway container; only mounted paths are
+  # visible. host_path is resolved by the gateway process, so these are
+  # paths inside the gateway container, not on the Docker host.
+  allow_host_bash: true
+  mounts:
+    - host_path: /workspace
+      container_path: /workspace
+      read_only: false
+    - host_path: /reference
+      container_path: /reference
+      read_only: true
+  bash_output_max_chars: 20000
+  read_file_output_max_chars: 50000
+  ls_output_max_chars: 20000
+
+skills:
+  path: /app/skills
+
+database:
+  backend: sqlite
+  sqlite_dir: .deer-flow/data
+
+run_events:
+  backend: jsonl
+  track_token_usage: true
+
+memory:
+  enabled: true
+  backend_config:
+    # "char" avoids tiktoken, which downloads its BPE file from an
+    # OpenAI/Azure URL at every start.
+    token_counting: char
+
+# llama.cpp has one slot: run sub-agents (Ultra) one at a time. The lead
+# agent is limited to this many concurrent task calls, so none queue.
+subagent_runtime:
+  max_running: 1
+
+# Compact a thread's history at 160k tokens (window 262k), keeping the
+# last 10 messages; summaries use the run's own model.
+summarization:
+  enabled: true
+  trigger:
+    - type: tokens
+      value: 160000
+  keep:
+    type: messages
+    value: 10
+
+agents_api:
+  enabled: false
+
+skill_evolution:
+  enabled: false

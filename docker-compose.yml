@@ -1,0 +1,113 @@
+name: deer-flow
+
+# DeerFlow v2.2.0 (published images) on the shared ai-backend network.
+#
+# Local UI: http://127.0.0.1:${DEER_FLOW_PORT:-2026}
+# Needs on ai-backend: litellm:4000 (model swol-doge) and a search gateway
+# at search-gateway:8080 (POST /v2/search, /v2/fetch; web_search/web_fetch).
+#
+# Egress: gateway and frontend sit only on the internal `deer-flow`
+# network and cannot reach the internet. nginx is the single bridge: it
+# publishes the UI port and forwards only LiteLLM (deer-flow-nginx:4000)
+# and the search gateway (deer-flow-nginx:8080) over ai-backend.
+#
+# One gateway worker, in-memory stream bridge, SQLite: no Redis,
+# PostgreSQL, Kubernetes or Docker socket. The gateway uses
+# LocalSandboxProvider, so "host" bash runs inside the gateway container
+# and sees only the paths mounted below.
+
+services:
+  gateway:
+    image: ghcr.io/bytedance/deer-flow-backend:v2.2.0
+    container_name: deer-flow-gateway
+    restart: unless-stopped
+    # As upstream's compose: exec + init so SIGTERM reaches uvicorn, and a
+    # stop grace above the lifespan shutdown (incl. the 30s memory flush).
+    command:
+      - sh
+      - -c
+      - cd backend && PYTHONPATH=. exec uv run --no-sync uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001 --workers 1 --timeout-graceful-shutdown 10
+    init: true
+    stop_grace_period: 90s
+    environment:
+      CI: "true"
+      DEER_FLOW_PROJECT_ROOT: /app
+      DEER_FLOW_HOME: /app/backend/.deer-flow
+      DEER_FLOW_CONFIG_PATH: /app/backend/config.yaml
+      DEER_FLOW_EXTENSIONS_CONFIG_PATH: /app/backend/extensions_config.json
+      DEER_FLOW_SKILLS_PATH: /app/skills
+
+      # Read by config.yaml ($NAME values).
+      SEARCH_GATEWAY_API_KEY: ${SEARCH_GATEWAY_API_KEY:-}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-ayyylmao}
+      # API key for other services (X-DeerFlow-Internal-Token); empty
+      # makes DeerFlow use a random per-start token, i.e. no API access.
+      DEER_FLOW_INTERNAL_AUTH_TOKEN: ${DEERFLOW_API_KEY:-}
+
+      # Login lockout counts failures per client IP; every browser request
+      # arrives from nginx, so trust its X-Real-IP.
+      AUTH_TRUSTED_PROXIES: deer-flow-nginx
+
+      LANGSMITH_TRACING: "false"
+      OTEL_SDK_DISABLED: "true"
+      DO_NOT_TRACK: "1"
+      NO_PROXY: localhost,127.0.0.1,::1,gateway,frontend,deer-flow-nginx
+      no_proxy: localhost,127.0.0.1,::1,gateway,frontend,deer-flow-nginx
+    volumes:
+      - ./config.yaml:/app/backend/config.yaml:ro
+      - ./extensions_config.json:/app/backend/extensions_config.json
+      - ./data:/app/backend/.deer-flow:rw
+      - ./skills:/app/skills:ro
+      - ./custom_tools:/app/backend/custom_tools:ro
+
+      # Agent-visible data; each is also listed under sandbox.mounts in
+      # config.yaml with the same in-container path.
+      - ./workspace:/workspace:rw
+      - ./reference:/reference:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health/ready', timeout=5)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks:
+      - deer-flow
+
+  frontend:
+    image: ghcr.io/bytedance/deer-flow-frontend:v2.2.0
+    container_name: deer-flow-frontend
+    restart: unless-stopped
+    environment:
+      DEER_FLOW_INTERNAL_GATEWAY_BASE_URL: http://gateway:8001
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-local-deer-flow-change-me}
+      DO_NOT_TRACK: "1"
+      NEXT_TELEMETRY_DISABLED: "1"
+    depends_on:
+      - gateway
+    networks:
+      - deer-flow
+
+  nginx:
+    image: nginx:1.29-alpine
+    container_name: deer-flow-nginx
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${DEER_FLOW_PORT:-2026}:2026"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      frontend:
+        condition: service_started
+      gateway:
+        condition: service_healthy
+    networks:
+      - deer-flow
+      - ai-backend
+
+networks:
+  deer-flow:
+    internal: true
+  ai-backend:
+    external: true
+  ext-shared:
+    external: true
